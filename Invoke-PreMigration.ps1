@@ -22,6 +22,8 @@ $dir = 'C:\migration'
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
 Write-Host "== Pre-migration capture: $env:COMPUTERNAME ==" -ForegroundColor Cyan
+function Step ($t) { Write-Host "  ... $t" -ForegroundColor DarkGray }
+Step 'network / DNS / secure channel'
 
 # ---------------------------------------------------------------------------
 # 1. Raw human-readable captures (belt and suspenders)
@@ -43,10 +45,14 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 2. Structured baseline for the post-migration script
 # ---------------------------------------------------------------------------
+Step 'firmware and adapters'
+# NOTE: deliberately NOT using Get-ComputerInfo - it can take minutes on 2016+.
 $firmware = 'Unknown'
-try { $firmware = (Get-ComputerInfo -Property BiosFirmwareType).BiosFirmwareType.ToString() } catch {}
+switch ("$env:firmware_type") {            # set by Windows 8 / 2012 and later
+    'UEFI'   { $firmware = 'Uefi' }
+    'Legacy' { $firmware = 'Bios' }
+}
 if ($firmware -eq 'Unknown') {
-    # Get-ComputerInfo is PS 5.1+; fall back to the boot loader path on 2012 R2
     $bcd = & cmd /c 'bcdedit /enum {current} 2>&1'
     if ($bcd -match 'winload\.efi') { $firmware = 'Uefi' } elseif ($bcd -match 'winload\.exe') { $firmware = 'Bios' }
 }
@@ -87,6 +93,7 @@ function Capture ($name, [scriptblock]$block) {
     catch { "CAPTURE FAILED: $($_.Exception.Message)" | Out-File "$dir\pre-$name.txt"; $script:warnings += "Capture '$name' failed: $($_.Exception.Message)" }
 }
 
+Step 'system info'
 # -- System / sizing / boot risks --
 $os   = Get-CimInstance Win32_OperatingSystem
 $cs   = Get-CimInstance Win32_ComputerSystem
@@ -116,6 +123,7 @@ if ($adapters.Count -gt 1) { $warnings += "Multi-homed: $($adapters.Count) activ
 if ($env:COMPUTERNAME -match '^WIN-[A-Z0-9]{11}$') { $warnings += 'Hostname is a default auto-generated name - consider renaming as part of the migration' }
 if ($sys.UptimeDays -gt 180) { $warnings += "Uptime is $($sys.UptimeDays) days - a long-unrebooted box may have surprises on first boot; consider a test reboot on ESXi first" }
 
+Step 'disks and volumes'
 # -- Disks / volumes / partition style / drive letters --
 Capture 'disks'   { Get-Disk | Select Number, FriendlyName, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}, PartitionStyle, IsBoot, IsSystem, OperationalStatus | Format-Table -AutoSize }
 Capture 'volumes' { Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | Sort DriveLetter | Select DriveLetter, FileSystemLabel, FileSystem, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize }
@@ -131,6 +139,7 @@ try {
     if ($bitlocker) { $flags += "BITLOCKER ON for $(($bitlocker.MountPoint) -join ', ') - have recovery keys ready; expect a recovery prompt on first Hyper-V boot" }
 } catch { 'BitLocker cmdlets not available (feature not installed) - almost certainly not encrypted' | Out-File "$dir\pre-bitlocker.txt" }
 
+Step 'services and ports'
 # -- Services: Automatic ones and whether they're running --
 $autoSvcs = @(Get-Service | Where-Object StartType -eq 'Automatic' | Sort Name | Select Name, DisplayName, Status)
 Capture 'services-auto' { $autoSvcs | Format-Table -AutoSize }
@@ -148,11 +157,13 @@ try {
     Capture 'listening-ports' { $listen | Format-Table -AutoSize }
 } catch { Capture 'listening-ports' { netstat -ano | Select-String LISTENING } }
 
+Step 'roles and features (can take ~15s)'
 # -- Roles / features --
 Capture 'roles-features' { Get-WindowsFeature | Where-Object Installed | Select Name, DisplayName | Format-Table -AutoSize }
 $roles = @()
 try { $roles = @((Get-WindowsFeature | Where-Object { $_.Installed -and $_.FeatureType -eq 'Role' }).Name) } catch {}
 
+Step 'shares, printers, tasks, software'
 # -- Shares --
 $shares = @()
 try {
@@ -182,6 +193,7 @@ Capture 'software' { $sw | Format-Table -AutoSize }
 $vmwareTools = $sw | Where-Object DisplayName -match 'VMware Tools'
 if ($vmwareTools) { $flags += "VMware Tools $($vmwareTools.DisplayVersion) installed - uninstall it as the LAST step before shutdown" }
 
+Step 'time, pagefile, hosts, firewall'
 # -- Time, page file, hosts, firewall --
 Capture 'time-source' { & cmd /c 'w32tm /query /source 2>&1'; & cmd /c 'w32tm /query /status 2>&1' }
 Capture 'pagefile'    { Get-CimInstance Win32_PageFileSetting | Select Name, InitialSize, MaximumSize | Format-Table -AutoSize; Get-CimInstance Win32_PageFileUsage | Select Name, AllocatedBaseSize | Format-Table -AutoSize }
@@ -192,6 +204,7 @@ $hostsCustom = Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" | Where-
 if ($hostsCustom) { $warnings += "hosts file has $(@($hostsCustom).Count) custom entr(ies) - review pre-hosts-file.txt" }
 Capture 'firewall'    { Get-NetFirewallProfile | Select Name, Enabled, DefaultInboundAction | Format-Table -AutoSize }
 
+Step 'event log (last 7 days of errors)'
 # -- Recent errors (baseline the normal noise) --
 Capture 'eventlog-errors' { Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2; StartTime=(Get-Date).AddDays(-7)} -MaxEvents 200 -ErrorAction SilentlyContinue | Select TimeCreated, LogName, ProviderName, Id, @{n='Message';e={$_.Message -replace "`r?`n",' ' | % { $_.Substring(0,[math]::Min(150,$_.Length)) }}} | Format-Table -AutoSize }
 
