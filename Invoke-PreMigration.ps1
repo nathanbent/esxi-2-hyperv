@@ -118,8 +118,8 @@ if ($sys.UptimeDays -gt 180) { $warnings += "Uptime is $($sys.UptimeDays) days -
 
 # -- Disks / volumes / partition style / drive letters --
 Capture 'disks'   { Get-Disk | Select Number, FriendlyName, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}, PartitionStyle, IsBoot, IsSystem, OperationalStatus | Format-Table -AutoSize }
-Capture 'volumes' { Get-Volume | Where-Object DriveLetter | Sort DriveLetter | Select DriveLetter, FileSystemLabel, FileSystem, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize }
-$volumes = @(Get-Volume | Where-Object DriveLetter | ForEach-Object { [pscustomobject]@{ Letter = "$($_.DriveLetter)"; Label = $_.FileSystemLabel; SizeGB = [math]::Round($_.Size/1GB,1) } })
+Capture 'volumes' { Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | Sort DriveLetter | Select DriveLetter, FileSystemLabel, FileSystem, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize }
+$volumes = @(Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 -and $_.DriveType -eq 'Fixed' } | ForEach-Object { [pscustomobject]@{ Letter = "$($_.DriveLetter)"; Label = $_.FileSystemLabel; SizeGB = [math]::Round($_.Size/1GB,1) } })
 $bootDisk = Get-Disk | Where-Object IsBoot
 if ($bootDisk -and $bootDisk.PartitionStyle -eq 'GPT' -and $firmware -eq 'Bios') { $flags += 'Boot disk is GPT but firmware reports BIOS - double-check generation choice' }
 
