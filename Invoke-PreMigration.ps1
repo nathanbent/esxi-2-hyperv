@@ -26,10 +26,19 @@ Write-Host "== Pre-migration capture: $env:COMPUTERNAME ==" -ForegroundColor Cya
 # ---------------------------------------------------------------------------
 # 1. Raw human-readable captures (belt and suspenders)
 # ---------------------------------------------------------------------------
+# Native commands write to stderr on failure (e.g. nslookup "can't find"),
+# which PowerShell treats as terminating under 'Stop' - so relax it here.
+# A failed lookup is itself useful data and should land in the file, not kill the run.
+$ErrorActionPreference = 'Continue'
 ipconfig /all               | Out-File "$dir\pre-ipconfig.txt"
 route print                 | Out-File "$dir\pre-routes.txt"
-nslookup $env:COMPUTERNAME 2>&1 | Out-File "$dir\pre-dns-record.txt"
-nltest /sc_verify:$env:USERDNSDOMAIN 2>&1 | Out-File "$dir\pre-securechannel.txt"
+& cmd /c "nslookup $env:COMPUTERNAME 2>&1" | Out-File "$dir\pre-dns-record.txt"
+if ($env:USERDNSDOMAIN) {
+    & cmd /c "nltest /sc_verify:$env:USERDNSDOMAIN 2>&1" | Out-File "$dir\pre-securechannel.txt"
+} else {
+    'Not domain-joined' | Out-File "$dir\pre-securechannel.txt"
+}
+$ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
 # 2. Structured baseline for the post-migration script
