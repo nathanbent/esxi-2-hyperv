@@ -141,7 +141,8 @@ try {
 
 Step 'services and ports'
 # -- Services: Automatic ones and whether they're running --
-$autoSvcs = @(Get-Service | Where-Object StartType -eq 'Automatic' | Sort Name | Select Name, DisplayName, Status)
+# Exclude per-user service instances (Name_<hex>) - they exist only while a session is logged in
+$autoSvcs = @(Get-Service | Where-Object { $_.StartType -eq 'Automatic' -and $_.Name -notmatch '_[0-9a-f]{5,8}$' } | Sort Name | Select Name, DisplayName, Status)
 Capture 'services-auto' { $autoSvcs | Format-Table -AutoSize }
 Capture 'services-all'  { Get-Service | Sort Name | Select Name, DisplayName, Status, StartType | Format-Table -AutoSize }
 $autoNotRunning = @($autoSvcs | Where-Object Status -ne 'Running')
@@ -150,7 +151,8 @@ if ($autoNotRunning) { $warnings += "$($autoNotRunning.Count) Automatic service(
 # -- Listening ports --
 $listen = @()
 try {
-    $listen = @(Get-NetTCPConnection -State Listen | Sort LocalPort -Unique | ForEach-Object {
+    # Exclude the ephemeral range (49152+) - RPC picks new ones every boot
+    $listen = @(Get-NetTCPConnection -State Listen | Where-Object LocalPort -lt 49152 | Sort LocalPort -Unique | ForEach-Object {
         $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
         [pscustomobject]@{ Port = $_.LocalPort; Process = $p.ProcessName }
     })
@@ -174,7 +176,8 @@ try {
 # -- Printers (only meaningful on print servers, cheap everywhere) --
 $printers = @()
 try {
-    $printers = @(Get-Printer | Select Name, DriverName, PortName, Shared, ShareName, PrinterStatus)
+    # Exclude RDP-redirected printers "(redirected N)" - they belong to someone's remote session, not this server
+    $printers = @(Get-Printer | Where-Object Name -notmatch '\(redirected \d+\)$' | Select Name, DriverName, PortName, Shared, ShareName, PrinterStatus)
     Capture 'printers'      { $printers | Format-Table -AutoSize }
     Capture 'printer-ports' { Get-PrinterPort | Select Name, PrinterHostAddress, PortNumber | Format-Table -AutoSize }
 } catch {}

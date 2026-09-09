@@ -61,6 +61,7 @@ if (-not (Test-Path $json)) {
     if ($b.ComputerName -ne $env:COMPUTERNAME) { Fail "Baseline hostname ($($b.ComputerName)) != this machine ($env:COMPUTERNAME)" }
 }
 $domainJoined = [bool]$env:USERDNSDOMAIN
+$isDC = (Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4   # 4 = backup DC, 5 = primary DC
 
 # ---------------------------------------------------------------------------
 # 1. Platform / generation / sizing
@@ -97,11 +98,12 @@ Info "Booted $uptimeMin minutes ago"
 # ---------------------------------------------------------------------------
 Section 'Ghost adapters'
 if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-    $ghosts = @(Get-PnpDevice -Class Net | Where-Object Status -eq 'Unknown')
+    # Exclude Microsoft IPv6 tunnel pseudo-interfaces (Teredo, ISATAP, 6to4) - always nonpresent, not VMware leftovers
+    $ghosts = @(Get-PnpDevice -Class Net | Where-Object { $_.Status -eq 'Unknown' -and $_.InstanceId -notmatch '^SWD\\IP_TUNNEL_VBUS' -and $_.FriendlyName -notmatch 'Teredo|ISATAP|6to4' })
     if ($ghosts) {
         foreach ($g in $ghosts) { Fail "Ghost adapter present: $($g.FriendlyName)"; Fix "pnputil /remove-device `"$($g.InstanceId)`"" }
         Info 'Or all at once:'
-        Fix 'Get-PnpDevice -Class Net | ? Status -eq "Unknown" | % { pnputil /remove-device $_.InstanceId }'
+        Fix 'Get-PnpDevice -Class Net | ? { $_.Status -eq "Unknown" -and $_.InstanceId -notmatch "IP_TUNNEL_VBUS" } | % { pnputil /remove-device $_.InstanceId }'
     } else { Pass 'No ghost (nonpresent) network adapters' }
 } else {
     # 2012 R2 fallback: the network class registry keeps entries for nonpresent NICs
@@ -207,9 +209,41 @@ else {
         if ($rec.Count -gt 1) { Warn "Multiple A records: $($rec.IPAddress -join ', ') - stale DHCP-era record? delete the wrong one in the DNS console" }
     } else { Fail "A record $fqdn -> $($rec.IPAddress -join ', ') but this machine is $myIp (stale)"; Fix 'ipconfig /registerdns   (delete the stale record in DNS if it lingers)' }
 
-    $sc = & cmd /c "nltest /sc_verify:$env:USERDNSDOMAIN 2>&1"
-    if ($sc -match 'Trust Verification Status = 0') { Pass "Secure channel to $env:USERDNSDOMAIN verified" }
-    else { Fail "Secure channel check failed: $(($sc | Select-Object -Last 2) -join ' | ')"; Fix 'Test-ComputerSecureChannel -Repair   (only after network is confirmed good)' }
+    if ($isDC) { Info 'Domain controller - secure channel test not applicable (see DC section below)' }
+    else {
+        $sc = & cmd /c "nltest /sc_verify:$env:USERDNSDOMAIN 2>&1"
+        if ($sc -match 'Trust Verification Status = 0') { Pass "Secure channel to $env:USERDNSDOMAIN verified" }
+        else { Fail "Secure channel check failed: $(($sc | Select-Object -Last 2) -join ' | ')"; Fix 'Test-ComputerSecureChannel -Repair   (only after network is confirmed good)' }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5b. Domain controller health (only when this box is a DC)
+# ---------------------------------------------------------------------------
+if ($isDC) {
+    Section 'Domain controller'
+    foreach ($svcName in 'NTDS','DNS','Netlogon','Kdc','DFSR') {
+        $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+        if (-not $svc) { continue }
+        if ($svc.Status -eq 'Running') { Pass "$svcName running" } else { Fail "$svcName is $($svc.Status)"; Fix "Start-Service $svcName" }
+    }
+    foreach ($sh in 'SYSVOL','NETLOGON') {
+        if (Get-SmbShare $sh -ErrorAction SilentlyContinue) { Pass "$sh share present" } else { Fail "$sh share MISSING - DC is not advertising" }
+    }
+    if ($anyUp) {
+        $adv = & cmd /c 'dcdiag /test:advertising 2>&1'
+        if ($adv -match 'passed test Advertising') { Pass 'dcdiag: Advertising passed' } else { Fail 'dcdiag: Advertising FAILED - run dcdiag /test:advertising /v' }
+        $rs = & cmd /c 'repadmin /replsum 2>&1'
+        $badLines = @($rs | Where-Object { $_ -match '^\s*\S+\s+\S+\s+(\d+)\s*/\s*\d+' -and [int]$matches[1] -gt 0 })
+        if ($badLines) {
+            foreach ($l in $badLines) { Warn "repadmin: $($l.Trim())" }
+            Info 'Failures whose last success predates the outage are usually just stale retries'
+            Fix "repadmin /syncall $env:COMPUTERNAME /AdeP ; repadmin /replsum"
+        } else { Pass 'repadmin /replsum: no replication failures' }
+        $src = (& cmd /c 'w32tm /query /source 2>&1') -join ''
+        if ($src -match 'VM IC Time Synchronization') { Warn "Time source is the Hyper-V host ($($src.Trim())) - consider disabling the Time Synchronization integration service so the DC uses the domain hierarchy / NTP" }
+        else { Pass "Time source: $($src.Trim())" }
+    } else { Warn 'DC checks skipped - no network' }
 }
 
 # ---------------------------------------------------------------------------
@@ -238,13 +272,17 @@ Section 'Services'
 if ($b -and $b.AutoServices) {
     $notRunning = @()
     foreach ($svcName in $b.AutoServices) {
-        if ($svcName -match '^VM|VGAuth') { continue }   # VMware services are expected to be gone
+        if ($svcName -match '^VM|VGAuth') { continue }          # VMware services are expected to be gone
+        if ($svcName -match '_[0-9a-f]{5,8}$') { continue }     # per-user session services (older baselines)
         $s = Get-Service $svcName -ErrorAction SilentlyContinue
         if (-not $s) { Warn "Service '$svcName' was running before and is now NOT INSTALLED" }
         elseif ($s.Status -ne 'Running') { $notRunning += $s }
     }
     if ($notRunning) {
-        foreach ($s in $notRunning) { Fail "Service '$($s.Name)' ($($s.DisplayName)) was running before, now $($s.Status)"; Fix "Start-Service $($s.Name)" }
+        foreach ($s in $notRunning) {
+            if ($s.Status -eq 'StartPending') { Warn "Service '$($s.Name)' ($($s.DisplayName)) is still StartPending - wait, then check System log for SCM 7000/7009/7011 events before forcing it" }
+            else { Fail "Service '$($s.Name)' ($($s.DisplayName)) was running before, now $($s.Status)"; Fix "Start-Service $($s.Name)" }
+        }
         Info 'Some services start delayed - if the box booted <5 min ago, wait and rerun before acting'
     } else { Pass "All $($b.AutoServices.Count) auto-start services that were running before are running now" }
 } else { Info 'No service baseline' }
@@ -257,7 +295,7 @@ if ($b -and $b.ListeningPorts) {
     if (-not $anyUp) { Warn 'Skipped - no network' }
     else {
         $livePorts = @((Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue).LocalPort | Sort-Object -Unique)
-        $missing = @($b.ListeningPorts | Where-Object { $livePorts -notcontains $_ })
+        $missing = @($b.ListeningPorts | Where-Object { $livePorts -notcontains $_ -and $_ -lt 49152 })   # ignore ephemeral RPC ports
         if ($missing) { Warn "Ports listening before but not now: $($missing -join ', ') - map to a service via netstat -ano" }
         else { Pass "All $($b.ListeningPorts.Count) previously listening TCP ports are listening" }
     }
@@ -275,7 +313,7 @@ if ($b -and $b.Shares) {
 
 if ($b -and $b.Printers) {
     $livePrinters = @(Get-Printer -ErrorAction SilentlyContinue)
-    $missing = @($b.Printers | Where-Object { $livePrinters.Name -notcontains $_ })
+    $missing = @($b.Printers | Where-Object { $livePrinters.Name -notcontains $_ -and $_ -notmatch '\(redirected \d+\)$' })   # ignore RDP-redirected printers
     if ($missing) { Fail "Printers missing: $($missing -join ', ')" } else { Pass "All $($b.Printers.Count) printers present" }
     $bad = @($livePrinters | Where-Object { @('Normal','Idle','Printing') -notcontains "$($_.PrinterStatus)" })
     foreach ($p in $bad) { Warn "Printer '$($p.Name)' status: $($p.PrinterStatus)" }
@@ -289,9 +327,11 @@ if ($b -and $b.Printers) {
 Section 'Integration services / VMware leftovers'
 $ic = @(Get-Service vmic* -ErrorAction SilentlyContinue)
 if ($ic) {
-    $icDown = @($ic | Where-Object { $_.StartType -ne 'Disabled' -and $_.Status -ne 'Running' })
+    # vmicguestinterface (off by default on the host) and vmicvmsession (PowerShell Direct, on-demand) are normally stopped
+    $onDemand = @('vmicguestinterface','vmicvmsession')
+    $icDown = @($ic | Where-Object { $_.StartType -ne 'Disabled' -and $_.Status -ne 'Running' -and $onDemand -notcontains $_.Name })
     if ($icDown) { foreach ($s in $icDown) { Warn "Hyper-V integration service $($s.Name) is $($s.Status)" } }
-    else { Pass "Hyper-V integration services present ($($ic.Count))" }
+    else { Pass "Hyper-V integration services running (heartbeat, KVP, shutdown, timesync, VSS)" }
 } else { Warn 'No Hyper-V integration services (vmic*) found - old OS may need Integration Services installed from the host' }
 
 $vmSvcs = @(Get-Service | Where-Object { $_.Name -match '^VM|VGAuth' -and $_.DisplayName -match 'VMware' })
