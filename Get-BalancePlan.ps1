@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    READ-ONLY: proposes a balanced placement of clustered VMs across the Up nodes (by assigned RAM),
+    Proposes (and optionally performs) a balanced placement of clustered VMs across the Up nodes (by assigned RAM),
     keeping anti-affinity groups apart and moving as few VMs as possible.
-    Prints the moves as commands to review and run yourself. Makes NO changes.
+    Prints the moves as commands. DRY RUN by default; -Execute performs them (verified, one at a time).
 
 .DESCRIPTION
     - Balances running clustered VMs by MemoryAssigned (add -IncludeOff to also place VMs that are off).
@@ -15,6 +15,7 @@
     .\Get-BalancePlan.ps1
     .\Get-BalancePlan.ps1 -KeepApart 'SPS-PS1,SPS-PS2','RG-01,RG-02'
     .\Get-BalancePlan.ps1 -KeepApart 'SPS-PS1,SPS-PS2' -ToleranceGB 16 -ShowPreferredOwners
+    .\Get-BalancePlan.ps1 -KeepApart 'SPS-PS1,SPS-PS2' -Execute -ApplyAntiAffinity
 #>
 [CmdletBinding()]
 param(
@@ -131,3 +132,102 @@ if ($ShowPreferredOwners) {
         "Set-ClusterOwnerNode -Group '$($p.VM)' -Owners $(($order | ForEach-Object { "'$_'" }) -join ',')"
     }
 }
+
+# ================= execute (only with -Execute) =================
+if (-not $Execute) {
+    Write-Host "`nDRY RUN - nothing changed. Re-run with -Execute to perform these moves." -ForegroundColor Yellow
+    return
+}
+$doAA = $ApplyAntiAffinity -and $newClassFor.Count
+if (-not $moves.Count -and -not $doAA) { return }
+
+$what = @()
+if ($moves.Count) { $what += "live-migrate $($moves.Count) VM(s)" }
+if ($doAA)        { $what += "set anti-affinity on $($newClassFor.Count) VM(s)" }
+if ((Read-Host "`nType YES to $($what -join ' and ')") -cne 'YES') { Write-Host 'Cancelled.'; return }
+
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$logCsv = Join-Path $LogDir 'balance.csv'
+$ov = @{}
+if (Test-Path $OverrideFile) { Import-Csv $OverrideFile | ForEach-Object { $ov[$_.VM] = $_.IP } }
+
+if ($doAA) {
+    Section 'Applying anti-affinity'
+    foreach ($vmName in $newClassFor.Keys) {
+        $c = New-Object System.Collections.Specialized.StringCollection
+        foreach ($x in @((($vms | Where-Object VM -eq $vmName).Existing) + $newClassFor[$vmName] | Select-Object -Unique)) { [void]$c.Add($x) }
+        (Get-ClusterGroup -Name $vmName).AntiAffinityClassNames = $c
+        Write-Host "  OK   $vmName -> $($c -join '; ')" -ForegroundColor Green
+    }
+}
+
+Section 'Moving'
+$i = 0
+foreach ($m in $moves) {
+    $i++
+    Write-Host ("[{0}/{1}] {2} ({3} GB) {4} -> {5}" -f $i, $moves.Count, $m.VM, $m.MemGB, $m.From, $m.To) -ForegroundColor Magenta
+    $row = [ordered]@{ Time = Get-Date -Format s; VM = $m.VM; From = $m.From; To = $m.To; MemGB = $m.MemGB; Seconds = ''; Status = 'FAILED'; Error = '' }
+    try {
+        $running = $m.State -eq 'Running'
+        $hb0 = ''; $pingIPs = @()
+        if ($running) {
+            $hb0 = (Get-VMIntegrationService -VMName $m.VM -ComputerName $m.From -Name 'Heartbeat').PrimaryStatusDescription
+            $ips = if ($ov.ContainsKey($m.VM)) { @($ov[$m.VM]) } else {
+                @((Get-VMNetworkAdapter -VMName $m.VM -ComputerName $m.From).IPAddresses |
+                    Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notlike '169.254.*' })
+            }
+            $pingIPs = @($ips | Where-Object { $_ -and (Test-Connection -ComputerName $_ -Count 2 -Quiet) })
+        }
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        if ($running) { Move-ClusterVirtualMachineRole -Name $m.VM -Node $m.To -MigrationType Live | Out-Null }
+        else          { Move-ClusterGroup -Name $m.VM -Node $m.To | Out-Null }
+        $sw.Stop(); $row.Seconds = [math]::Round($sw.Elapsed.TotalSeconds)
+
+        $owner = (Get-ClusterGroup -Name $m.VM).OwnerNode.Name
+        if ($owner -ne $m.To) { throw "owner is $owner, expected $($m.To)" }
+
+        $checks = @("on $owner")
+        if ($running) {
+            $vm = Get-VM -Name $m.VM -ComputerName $m.To
+            if ($vm.State -ne 'Running') { throw "VM is $($vm.State) after migration" }
+            if ($hb0 -eq 'OK') {
+                $hb = $null
+                foreach ($k in 1..12) { $hb = (Get-VMIntegrationService -VM $vm -Name 'Heartbeat').PrimaryStatusDescription; if ($hb -eq 'OK') { break }; Start-Sleep -Seconds 5 }
+                if ($hb -ne 'OK') { throw "heartbeat '$hb' after migration" }
+                $checks += 'heartbeat OK'
+            }
+            if ($pingIPs.Count) {
+                $up = @()
+                foreach ($k in 1..6) {
+                    $up = @($pingIPs | Where-Object { Test-Connection -ComputerName $_ -Count 2 -Quiet })
+                    if ($up.Count -eq $pingIPs.Count) { break }
+                    Start-Sleep -Seconds 5
+                }
+                if ($up.Count -ne $pingIPs.Count) { throw "not answering ping after ~30s: $(@($pingIPs | Where-Object { $_ -notin $up }) -join ', ')" }
+                $checks += "ping OK ($($pingIPs -join ','))"
+            } else { $checks += 'ping n/a' }
+        }
+        $row.Status = 'OK'
+        Write-Host "     OK   $($row.Seconds)s - $($checks -join ', ')" -ForegroundColor Green
+    }
+    catch {
+        $row.Error = $_.Exception.Message
+        Write-Host "     FAILED: $($row.Error)" -ForegroundColor Red
+    }
+    finally {
+        [pscustomobject]$row | Export-Csv -Path $logCsv -Append -NoTypeInformation
+    }
+    if ($row.Status -ne 'OK') { Write-Host 'Stopping - remaining moves not attempted. Re-run the plan to recalculate.' -ForegroundColor Red; break }
+}
+
+Section 'Result'
+foreach ($n in $nodes) {
+    $gb = 0.0
+    foreach ($g in @(Get-ClusterGroup | Where-Object { $_.GroupType -eq 'VirtualMachine' -and $_.OwnerNode.Name -eq $n })) {
+        $v = Get-VM -Name $g.Name -ComputerName $n -ErrorAction SilentlyContinue
+        if ($v -and ($v.State -eq 'Running' -or $IncludeOff)) { $gb += $v.MemoryAssigned / 1GB }
+    }
+    '{0,-12} {1,7:N1} GB' -f $n, $gb
+}
+Write-Host "Log: $logCsv" -ForegroundColor Cyan
