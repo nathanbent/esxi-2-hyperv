@@ -4,15 +4,15 @@
     Run INSIDE the guest VM while it is still running on ESXi.
 
 .DESCRIPTION
-    Captures the network configuration and machine identity to C:\migration
-    as both human-readable text and a machine-readable baseline.json that
-    Invoke-PostMigration.ps1 consumes to reapply settings automatically.
+    Captures network config, sizing, firmware type, volumes, services, ports,
+    shares, printers, etc. to C:\migration as human-readable text plus a
+    machine-readable baseline.json that Invoke-PostMigrationCheck.ps1 compares
+    against after the move. Makes NO changes to the machine.
 
     Safe to run repeatedly; each run overwrites the previous baseline.
 
 .NOTES
-    Run as administrator. PowerShell 5.1+ (Server 2012 R2 needs WMF update;
-    2016+ works out of the box).
+    Run as administrator. Works on PS 4.0 (2012 R2) and up.
 #>
 
 #Requires -RunAsAdministrator
