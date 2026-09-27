@@ -158,19 +158,70 @@ function Select-LeaveNode {
     if ($n) { $script:LeaveNode = $n; Write-Host "Leave-on node: $n" -ForegroundColor Green }
 }
 
+function Save-PingOverride ($Name, $IP) {
+    $ov = Get-Overrides
+    if ($IP) { $ov[$Name] = $IP } else { $ov.Remove($Name) }
+    if ($ov.Count) {
+        $ov.GetEnumerator() | ForEach-Object { [pscustomobject]@{ VM = $_.Key; IP = $_.Value } } |
+            Export-Csv $OverrideFile -NoTypeInformation
+    } elseif (Test-Path $OverrideFile) { Remove-Item $OverrideFile }
+}
+
 function Set-PingOverride {
     $name = Read-Host 'VM name (exact, as shown in Hyper-V)'
     $known = (Get-ClusterGroup -Name $name -ErrorAction SilentlyContinue) -or (Get-VM -Name $name -ErrorAction SilentlyContinue)
     if (-not $known) { Write-Host "No VM named '$name' in the cluster or on this node." -ForegroundColor Red; return }
     $ip = Read-Host 'IP to ping (blank = remove saved IP)'
     if ($ip -and $ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { Write-Host 'Not an IPv4 address.' -ForegroundColor Red; return }
-    $ov = Get-Overrides
-    if ($ip) { $ov[$name] = $ip } else { $ov.Remove($name) }
-    if ($ov.Count) {
-        $ov.GetEnumerator() | ForEach-Object { [pscustomobject]@{ VM = $_.Key; IP = $_.Value } } |
-            Export-Csv $OverrideFile -NoTypeInformation
-    } elseif (Test-Path $OverrideFile) { Remove-Item $OverrideFile }
+    Save-PingOverride $name $ip
     Write-Host 'Saved.' -ForegroundColor Green
+}
+
+function Get-VMNode ($Name) {
+    $g = Get-ClusterGroup -Name $Name -ErrorAction SilentlyContinue
+    if ($g -and $g.GroupType -eq 'VirtualMachine') { $g.OwnerNode.Name } else { $env:COMPUTERNAME }
+}
+
+function Get-PingPlan {
+    $ov = Get-Overrides
+    foreach ($s in $script:Selected) {
+        $node = Get-VMNode $s.VM
+        $vm   = Get-VM -Name $s.VM -ComputerName $node
+        $src  = 'None'; $ips = @()
+        if ($ov.ContainsKey($s.VM)) { $src = 'Saved'; $ips = @($ov[$s.VM]) }
+        else {
+            $ips = @((Get-VMNetworkAdapter -VMName $s.VM -ComputerName $node).IPAddresses |
+                     Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notlike '169.254.*' })
+            if ($ips.Count) { $src = 'Reported' }
+        }
+        $ok = @($ips | Where-Object { $_ -and (Test-Connection -ComputerName $_ -Count 2 -Quiet) })
+        [pscustomobject]@{
+            VM         = $s.VM
+            State      = [string]$vm.State
+            Source     = $src
+            IPs        = $ips -join ','
+            Responding = $ok -join ','
+            PingTests  = if ($vm.State -ne 'Running') { 'n/a (off)' } elseif ($ok.Count) { 'YES' } else { 'NO' }
+        }
+    }
+}
+
+function Confirm-PingPlan {
+    Write-Host "`nChecking which IP each VM will be ping-tested on..." -ForegroundColor DarkGray
+    $plan = @(Get-PingPlan)
+    $plan | Format-Table VM, State, Source, IPs, Responding, PingTests -AutoSize | Out-Host
+    $changed = $false
+    foreach ($p in @($plan | Where-Object PingTests -eq 'NO')) {
+        $ip = Read-Host "No responding IP for '$($p.VM)'. Enter an IP to ping (blank = move without ping tests)"
+        if (-not $ip) { continue }
+        if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { Write-Host 'Not an IPv4 address - skipping.' -ForegroundColor Red; continue }
+        Save-PingOverride $p.VM $ip
+        $changed = $true
+    }
+    if ($changed) {
+        Write-Host 'Re-checking...' -ForegroundColor DarkGray
+        Get-PingPlan | Format-Table VM, State, Source, IPs, Responding, PingTests -AutoSize | Out-Host
+    }
 }
 
 function Invoke-Mover ([switch]$Execute, [switch]$LiveMigrate, [switch]$Leave) {
@@ -181,6 +232,8 @@ function Invoke-Mover ([switch]$Execute, [switch]$LiveMigrate, [switch]$Leave) {
         DCNames = $DCNames; LogDir = $LogDir; PingOverride = (Get-Overrides)
     }
     if ($Execute) {
+        Confirm-PingPlan
+        $p.PingOverride = Get-Overrides
         $gb = [math]::Round(($script:Selected | Measure-Object SizeGB -Sum).Sum, 1)
         $what = if ($Leave) { "move to $($script:TargetCsv), cluster and LEAVE ON $($script:LeaveNode)" }
                 elseif ($LiveMigrate) { "move to $($script:TargetCsv), cluster and live-migration test" }
