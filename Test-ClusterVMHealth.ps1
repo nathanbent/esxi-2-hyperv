@@ -206,15 +206,22 @@ if ($dcRun.Count -gt 1 -and $upNodes.Count -gt 1) {
 }
 
 # ---------------- capacity ----------------
-Section 'Failover capacity (can one node run everything?)'
-$clusterMemGB = [math]::Round((($rows | Where-Object State -eq 'Running' | Measure-Object MemGB -Sum).Sum), 1)
+Section 'Failover capacity (can any one node run every VM?)'
+$allRunning = @(foreach ($n in $upNodes) {
+    Get-VM -ComputerName $n | Where-Object State -eq 'Running' |
+        Select-Object @{n='Node';e={$n}}, Name, IsClustered, @{n='MemGB';e={[math]::Round($_.MemoryAssigned/1GB,1)}}
+})
+$allGB  = [math]::Round(($allRunning | Measure-Object MemGB -Sum).Sum, 1)
+$needGB = $allGB + $HostReserveGB
+Say INFO "All running VMs use ~$allGB GB; any node taking over everything needs ~$needGB GB (incl. $HostReserveGB GB host reserve)"
 foreach ($n in $upNodes) {
     $totalGB = [math]::Round((Get-CimInstance Win32_ComputerSystem -ComputerName $n).TotalPhysicalMemory / 1GB)
-    $localGB = [math]::Round(((Get-VM -ComputerName $n | Where-Object { -not $_.IsClustered -and $_.State -eq 'Running' } |
-                ForEach-Object { $_.MemoryAssigned } | Measure-Object -Sum).Sum) / 1GB, 1)
-    $needGB  = $clusterMemGB + $localGB + $HostReserveGB
-    $msg = "$n : $totalGB GB RAM; needs ~$needGB GB to run all clustered VMs ($clusterMemGB) + its own non-clustered VMs ($localGB) + host reserve ($HostReserveGB)"
-    Say $(if ($needGB -le $totalGB) {'PASS'} else {'WARN'}) $msg
+    Say $(if ($needGB -le $totalGB) {'PASS'} else {'WARN'}) ("{0}: {1} GB RAM - {2}" -f $n, $totalGB,
+        $(if ($needGB -le $totalGB) { "can run every VM ({0:N0} GB headroom)" -f ($totalGB - $needGB) } else { "short by {0:N0} GB" -f ($needGB - $totalGB) }))
+}
+foreach ($grp in @($allRunning | Where-Object { -not $_.IsClustered } | Group-Object Node)) {
+    $gb = [math]::Round(($grp.Group | Measure-Object MemGB -Sum).Sum, 1)
+    Say WARN "$($grp.Name) runs $($grp.Count) non-clustered VM(s) ($gb GB) - they go down with $($grp.Name) and can't fail over, regardless of RAM"
 }
 
 # ---------------- leftovers ----------------
