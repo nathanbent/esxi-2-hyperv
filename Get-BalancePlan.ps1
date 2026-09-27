@@ -21,7 +21,11 @@ param(
     [string[]]$KeepApart   = @(),   # each entry is a comma-separated set of VM names to keep on different nodes
     [double]  $ToleranceGB = 8,     # keep a VM on its current node if that's within this much of the best node
     [switch]  $IncludeOff,
-    [switch]  $ShowPreferredOwners
+    [switch]  $ShowPreferredOwners,
+    [switch]  $Execute,             # perform the moves (one at a time, verified, stops on first failure)
+    [switch]  $ApplyAntiAffinity,   # with -Execute: also set anti-affinity for new -KeepApart groups
+    [string]  $OverrideFile = (Join-Path $PSScriptRoot 'ping-overrides.csv'),
+    [string]  $LogDir       = 'C:\temp\csv-move'
 )
 
 $ErrorActionPreference = 'Stop'
