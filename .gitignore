@@ -1,0 +1,3 @@
+# Site-specific settings and state written by Start-VMMover.ps1
+mover-config.json
+ping-overrides.csv

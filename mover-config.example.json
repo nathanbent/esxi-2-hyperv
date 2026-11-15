@@ -1,0 +1,7 @@
+{
+    "DefaultCsv":  "Cluster Disk 1",
+    "CsvSubfolder":  "VMs",
+    "DCNames":  [ "DC01", "DC02" ],
+    "LogDir":  "C:\\temp\\csv-move",
+    "DefaultLeaveOnNode":  ""
+}

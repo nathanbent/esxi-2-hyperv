@@ -24,10 +24,10 @@
     Logs: transcript + moves.csv in $LogDir.
 
 .EXAMPLE
-    .\Move-VMToCsv.ps1 -VMName 'SMTP Server' -CsvName hv-csv-1                          # preflight only
-    .\Move-VMToCsv.ps1 -VMName 'SMTP Server' -CsvName hv-csv-1 -Execute -TestLiveMigration
-    .\Move-VMToCsv.ps1 -VMName 'RG-01' -CsvName hv-csv-1 -Execute -LeaveOnNode SPS-HV-2
-    .\Move-VMToCsv.ps1 -VMName 'SPS-SQL' -CsvName hv-csv-2 -Execute                       # re-home a clustered VM
+    .\Move-VMToCsv.ps1 -VMName 'APP01' -CsvName 'Cluster Disk 1'                                  # preflight only
+    .\Move-VMToCsv.ps1 -VMName 'APP01' -CsvName 'Cluster Disk 1' -Execute -TestLiveMigration
+    .\Move-VMToCsv.ps1 -VMName 'APP01','APP02' -CsvName 'Cluster Disk 1' -Execute -LeaveOnNode HV-NODE2
+    .\Move-VMToCsv.ps1 -VMName 'SQL01' -CsvName 'Cluster Disk 2' -Execute                         # re-home a clustered VM
 #>
 [CmdletBinding()]
 param(

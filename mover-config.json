@@ -1,7 +1,0 @@
-{
-    "DefaultCsv":  "hv-csv-1",
-    "CsvSubfolder":  "VMs",
-    "DCNames":  [ "DC1", "DC2", "DC3" ],
-    "LogDir":  "C:\\temp\\csv-move",
-    "DefaultLeaveOnNode":  "SPS-HV-2"
-}

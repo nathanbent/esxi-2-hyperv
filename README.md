@@ -1,10 +1,18 @@
 # ESXi to Hyper-V Migration Procedure
 
 Per-VM procedure for moving Windows guests from ESXi to Hyper-V using Veeam
-backup/restore. Both scripts are **read-only** - they gather, compare, and
-suggest fixes. All changes are made by hand after review.
+backup/restore, plus tooling for getting the restored VMs onto a Hyper-V
+failover cluster's Cluster Shared Volumes (CSVs) and checking the cluster's
+health afterwards.
+
+Everything is **read-only** unless stated otherwise - the scripts gather,
+compare, and suggest fixes, and changes are made by hand after review. The
+one exception is `Move-VMToCsv.ps1` (and its menu, `Start-VMMover.ps1`),
+which is a dry run unless given `-Execute`.
 
 ## Scripts
+
+### Guest-side (per VM)
 
 | Script | Runs where | Does what |
 |---|---|---|
@@ -15,6 +23,39 @@ Both write to `C:\migration\`. Read `pre-summary.txt` and `post-summary.txt`;
 everything else is reference.
 
 Works on PowerShell 4.0+ (Server 2012 R2 and newer).
+
+### Host-side (Hyper-V cluster)
+
+Run on a cluster node as a domain admin, with the FailoverClusters and
+Hyper-V PowerShell modules. Nothing site-specific is hardcoded - CSVs, nodes
+and domain controllers are discovered from the cluster and AD.
+
+| Script | Does what |
+|---|---|
+| `Invoke-PreCsvMove.ps1` | Read-only readiness report for the VMs on this node: CSV I/O mode per node, host CPU models, per-VM size / generation / checkpoints / ISOs / pass-through disks, CSV free space, suggested move order. |
+| `Move-VMToCsv.ps1` | Moves VM storage onto a CSV and makes the VM highly available, with ping + heartbeat checks at every step. Also re-homes clustered VMs between CSVs. Optional live-migration round trip. **Dry run unless `-Execute`.** Logs to `moves.csv` + a transcript. |
+| `Start-VMMover.ps1` | Menu front-end for `Move-VMToCsv.ps1`: pick VMs from a grid, pick the target CSV, preflight, move. Keep it in the same folder as `Move-VMToCsv.ps1`. |
+| `Test-ClusterVMHealth.ps1` | Read-only cluster health check: nodes, quorum, networks, CSV space and Direct I/O, per-VM storage / vSwitch / heartbeat / checkpoints, DC priority and anti-affinity, N+1 memory capacity, non-clustered VMs, recent cluster / Hyper-V errors. |
+
+#### Configuration
+
+`Start-VMMover.ps1`, `Invoke-PreCsvMove.ps1` and `Test-ClusterVMHealth.ps1`
+read optional site settings from `mover-config.json` next to the scripts.
+Copy `mover-config.example.json` to `mover-config.json` and edit it, or let
+`Start-VMMover.ps1` create one with defaults on first run. The real file is
+git-ignored, as is `ping-overrides.csv` (saved ping IPs for VMs that don't
+report one through integration services).
+
+| Setting | Meaning |
+|---|---|
+| `DefaultCsv` | CSV name (as in `Get-ClusterSharedVolume`) to target by default. Blank = first CSV. |
+| `CsvSubfolder` | Folder on the CSV that holds VM folders. Default `VMs`. |
+| `DCNames` | Hyper-V VM names of domain controllers, if they differ from their AD names. DCs are also auto-detected from AD. |
+| `LogDir` | Where `Move-VMToCsv.ps1` writes `moves.csv` and transcripts. |
+| `DefaultLeaveOnNode` | Node to migrate VMs to with the "leave on node" option. Blank = first other Up node. |
+
+DCs get cluster priority High and an anti-affinity class (`DCs` by default)
+when clustered, so the cluster keeps them on separate nodes.
 
 ## Getting the scripts onto a VM
 
@@ -90,7 +131,7 @@ perfectly consistent final state.
 
 Veeam: Restore > Entire VM restore > Restore to Hyper-V.
 
-- Target: the Hyper-V host and the Pure volume for VHDX storage.
+- Target: the Hyper-V host and the volume for VHDX storage.
 - Generation: match the firmware type from step 1.
 - Network: **do not connect a network adapter** (or set it to not
   connected). This prevents the VM from taking a DHCP lease on first boot,
@@ -177,7 +218,10 @@ Print a test page. **Outage ends here.**
 - Leave the source VM powered off on ESXi for a soak period (days to a
   week depending on how critical it is). Then remove from inventory and
   delete.
-- Attach the new VM's storage to a Pure protection group / Veeam job.
+- Add the new VM to your backup / storage snapshot / replication jobs.
+- On a cluster: if the VM was restored to standalone storage, move it onto
+  a CSV and make it highly available with `Move-VMToCsv.ps1` (or
+  `Start-VMMover.ps1`), then run `Test-ClusterVMHealth.ps1`.
 - Keep `C:\migration\` on the guest - the pre and post summaries are the
   record of what the box looked like before and after.
 
